@@ -51,8 +51,10 @@ exits 0. *Migrate:* a wrapper that treats any non-zero exit from an interactive
   order (default `[defaults] example`, else `.env.example`). Each target keeps
   its assignments, moved as slices of the original text, so values, quoting,
   escapes, interpolation, inline comments and multiline values are unchanged.
-  - A missing key is added as `KEY=`; extra keys are kept at the end, in
-    order, under `# Environment-specific settings`.
+  - A missing key gets a `# KEY=` placeholder, never a blank `KEY=`, which
+    readers treat differently from an absent key and which would hide it from
+    `sync --check` and `diff`. Extra keys are kept at the end, in order, under
+    `# Environment-specific settings`.
   - Comments only the target has are always kept, by a fixed rule (attached
     to the next assignment, or standalone after the one above). A case the
     rule cannot decide is refused, as are duplicate keys, a line that does

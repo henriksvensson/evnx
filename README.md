@@ -502,14 +502,20 @@ there.
 # Several environments at once: every file is checked before any is written
 evnx align --reference .env.example --env .env.development --env .env.test
 
-# Preview what would move, be added, or be kept as extra; write nothing, exit 0
+# Preview what would move, what is missing and what is extra; write nothing, exit 0
 evnx align --env .env --dry-run
 
 # CI: exit 1 when a file is out of alignment
 evnx align --env-name production --check
 ```
 
-- A key the file lacks is added as `KEY=`. The template's value is never copied.
+- A key the file lacks gets a `# KEY=` placeholder, which is dropped once the key has a
+  value. It is never the template's value, and never a blank `KEY=`, which programs read
+  differently from an absent key. `evnx sync --check` still reports the key, and
+  `evnx sync --direction reverse` still fills it.
+- **Order comes from the template**, so list variables there in an order that works if
+  one refers to another: Docker Compose resolves `${VAR}` from the top down. A key only
+  the file has moves to the end, below any template key that refers to it.
 - Keys the template lacks are kept, in their order, at the end under
   `# Environment-specific settings`.
 - **Comments.** A comment the template also has belongs to the template, which
@@ -533,7 +539,7 @@ evnx align --env-name production --check
 | `--env PATH`, `--env-name NAME` | Files to align; both repeatable (default `.env`, or `[defaults] env_name`) |
 | `-n`, `--dry-run` | Report; write nothing; exit 0 |
 | `--check` | Exit 0 aligned, 1 out of alignment, 2 no verdict; writes nothing |
-| `--format json` | `moved`, `added` and `extra` per file, with line numbers |
+| `--format json` | `moved`, `missing` and `extra` per file, with line numbers |
 
 ---
 

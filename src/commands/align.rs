@@ -258,7 +258,7 @@ struct JsonTarget<'a> {
     /// dry run).
     status: &'static str,
     moved: Vec<JsonMove<'a>>,
-    added: Vec<JsonAdded<'a>>,
+    missing: Vec<JsonMissing<'a>>,
     extra: Vec<JsonMove<'a>>,
     target_only_comments: usize,
 }
@@ -271,7 +271,7 @@ struct JsonMove<'a> {
 }
 
 #[derive(Serialize)]
-struct JsonAdded<'a> {
+struct JsonMissing<'a> {
     key: &'a str,
     line: usize,
 }
@@ -303,11 +303,11 @@ fn report(opts: &Options, prepared: &[Prepared], written: &[String]) {
                     file: label(&p.path),
                     status: status(p, written),
                     moved: moves(&p.plan.moved),
-                    added: p
+                    missing: p
                         .plan
-                        .added
+                        .missing
                         .iter()
-                        .map(|a| JsonAdded {
+                        .map(|a| JsonMissing {
                             key: &a.key,
                             line: a.line,
                         })
@@ -343,7 +343,19 @@ fn report(opts: &Options, prepared: &[Prepared], written: &[String]) {
         if !show {
             continue;
         }
-        println!("{}  {s}", label(&p.path));
+        // A file can be aligned and still lack keys: their placeholders are in
+        // place. Said here, because --check exits 0 for it.
+        let lacking = p.plan.missing.len();
+        if !p.plan.changed && lacking > 0 {
+            println!(
+                "{}  {s}; {lacking} key{} with no value (# KEY= placeholder{})",
+                label(&p.path),
+                plural(lacking),
+                plural(lacking)
+            );
+        } else {
+            println!("{}  {s}", label(&p.path));
+        }
         if p.plan.changed {
             details(&p.plan);
         }
@@ -399,8 +411,11 @@ fn details(plan: &Plan) {
     for m in &plan.moved {
         println!("    moved  {}  line {} → {}", m.key, m.from_line, m.to_line);
     }
-    for a in &plan.added {
-        println!("    added  {}  line {} (empty)", a.key, a.line);
+    for a in &plan.missing {
+        println!(
+            "    missing  {}  line {} (written as # {}=)",
+            a.key, a.line, a.key
+        );
     }
     for m in &plan.extra {
         println!(
@@ -418,7 +433,7 @@ fn details(plan: &Plan) {
             plural(plan.target_comments)
         );
     }
-    if plan.moved.is_empty() && plan.added.is_empty() && plan.extra.is_empty() {
+    if plan.moved.is_empty() && plan.missing.is_empty() && plan.extra.is_empty() {
         println!("    layout  headings, comments or blank lines from the reference");
     }
 }

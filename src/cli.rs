@@ -2499,8 +2499,8 @@ file, names that collide, a filter that leaves nothing).
 
     /// Give .env files the template's sections, comments and key order, keeping their values.
     ///
-    /// Each assignment is moved exactly as written; a key the file lacks is
-    /// added as `KEY=`, and keys the template lacks are kept at the end.
+    /// Each assignment is moved exactly as written; a key the file lacks gets a
+    /// `# KEY=` placeholder, and keys the template lacks are kept at the end.
     /// Prints file names, key names and line numbers, never a value.
     #[command(after_help = docs::ALIGN.after_help)]
     Align {
@@ -2518,13 +2518,14 @@ file, names that collide, a filter that leaves nothing).
         #[arg(long, value_name = "NAME")]
         env_name: Vec<String>,
 
-        /// Show what would move, be added or be kept as extra; write nothing.
+        /// Show what would move, what is missing and what is extra; write nothing.
         #[arg(long, short = 'n')]
         dry_run: bool,
 
         /// Report alignment through the exit code; write nothing.
         ///
-        ///   0  every file already has the template's layout
+        ///   0  every file already has the template's layout (`evnx sync --check`
+        ///      is what reports keys with no value)
         ///   1  a file is out of alignment
         ///   2  no verdict — a file is missing, will not parse, or is the
         ///      same file as another one named

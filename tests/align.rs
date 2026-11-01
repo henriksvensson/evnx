@@ -164,27 +164,75 @@ fn assignment_blocks_are_kept_byte_for_byte() {
 }
 
 #[test]
-fn missing_keys_are_empty_and_extra_keys_keep_their_order_at_the_end() {
+fn missing_keys_get_a_placeholder_and_extra_keys_keep_their_order_at_the_end() {
     let p = project(&[(".env", &format!("ZETA=1{MARK}\nDB_HOST=h\nALPHA=2{MARK}\n"))]);
     let out = align(&p, &["--dry-run"]);
     out.assert_code(0)
-        .assert_contains("added  DB_PORT")
-        .assert_contains("added  REDIS_URL")
-        .assert_contains("added  JWT_SECRET")
+        .assert_contains("missing  DB_PORT")
+        .assert_contains("missing  REDIS_URL")
+        .assert_contains("missing  JWT_SECRET")
         .assert_contains("extra  ZETA")
         .assert_contains("extra  ALPHA");
 
     align(&p, &[]).assert_code(0);
     let env = p.read(".env");
-    assert!(
-        env.contains("DB_PORT=\n") && env.contains("REDIS_URL=\n") && env.contains("JWT_SECRET=\n")
-    );
+    for key in ["DB_PORT", "REDIS_URL", "JWT_SECRET"] {
+        assert!(env.contains(&format!("# {key}=\n")), "{key}: {env}");
+        assert!(
+            !env.lines().any(|l| l.starts_with(&format!("{key}="))),
+            "{key} must stay absent: {env}"
+        );
+    }
     assert!(
         env.ends_with(&format!(
-            "JWT_SECRET=\n\n# Environment-specific settings\nZETA=1{MARK}\nALPHA=2{MARK}\n"
+            "# JWT_SECRET=\n\n# Environment-specific settings\nZETA=1{MARK}\nALPHA=2{MARK}\n"
         )),
         "{env}"
     );
+}
+
+/// Why a missing key is `# KEY=` and not `KEY=`: a blank assignment turned both
+/// of these checks green on a file that still has no value for the key.
+#[test]
+fn evnx_still_reports_a_missing_key_after_aligning() {
+    let p = Project::new()
+        .example("A=\nB=template-value\n")
+        .env("A=1\n");
+    let before = (
+        run(p.path(), &["sync", "--check", "--direction", "reverse"]).code,
+        run(p.path(), &["diff", "--fail-on", "missing"]).code,
+    );
+    assert_eq!(before, (Some(1), Some(1)));
+
+    align(&p, &[]).assert_code(0);
+    assert_eq!(p.read(".env"), "A=1\n# B=\n");
+    run(p.path(), &["sync", "--check", "--direction", "reverse"]).assert_code(1);
+    run(p.path(), &["diff", "--fail-on", "missing"]).assert_code(1);
+    // Aligned is a statement about layout: it passes, and says what is missing.
+    align(&p, &["--check"])
+        .assert_code(0)
+        .assert_contains("./.env  already aligned; 1 key with no value");
+}
+
+#[test]
+fn sync_fills_a_placeholder_and_aligning_again_tidies_up() {
+    let p = Project::new()
+        .example("A=\n# About B\nB=template-value\nC=\n")
+        .env("C=3\nA=1\n");
+    align(&p, &[]).assert_code(0);
+    assert_eq!(p.read(".env"), "A=1\n# About B\n# B=\nC=3\n");
+
+    run(p.path(), &["sync", "--direction", "reverse", "--force"]).assert_code(0);
+    assert!(p.read(".env").contains("B=template-value\n"));
+
+    align(&p, &[]).assert_code(0);
+    assert_eq!(
+        p.read(".env"),
+        "A=1\n# About B\n# Added by evnx sync\nB=template-value\nC=3\n",
+        "the value in place and the placeholder gone; sync's note is only this file's \
+         comment, directly above the key, so the comment rule keeps it"
+    );
+    align(&p, &["--check"]).assert_code(0);
 }
 
 #[test]
@@ -243,8 +291,8 @@ fn crlf_and_a_missing_final_newline_are_kept() {
         !env.replace("\r\n", "").contains('\n'),
         "CRLF only: {env:?}"
     );
-    assert!(env.contains("DB_HOST=h\r\nDB_PORT=\r\n"), "{env:?}");
-    assert!(env.ends_with("JWT_SECRET="), "no final newline: {env:?}");
+    assert!(env.contains("DB_HOST=h\r\n# DB_PORT=\r\n"), "{env:?}");
+    assert!(env.ends_with("# JWT_SECRET="), "no final newline: {env:?}");
     align(&p, &["--check"]).assert_code(0);
 }
 
@@ -386,6 +434,8 @@ fn check_and_dry_run_never_write() {
     assert_eq!(v["aligned"], false);
     assert_eq!(v["targets"][0]["status"], "out-of-alignment");
     assert_eq!(v["targets"][0]["moved"][0]["key"], "DB_HOST");
+    assert_eq!(v["targets"][0]["missing"][0]["key"], "DB_PORT");
+    assert!(v["targets"][0].get("added").is_none());
 
     assert_eq!(state(&p.join(".env")), before);
     let names: Vec<_> = std::fs::read_dir(p.path()).unwrap().collect();

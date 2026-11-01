@@ -163,7 +163,8 @@ What it does:\n\
 \x20 The template (--reference) decides headings, comments, blank lines and key\n\
 \x20 order. Each file keeps its own assignments, moved byte for byte: values,\n\
 \x20 quoting, inline comments and multiline values are never rewritten.\n\
-\x20 Missing keys are added as KEY= (never the template's value); keys the\n\
+\x20 A key the file lacks gets a # KEY= placeholder: never the template's value,\n\
+\x20 and never a blank KEY=, so what the app reads does not change. Keys the\n\
 \x20 template lacks are kept, in order, under \"Environment-specific settings\".\n\
 \n\
 Comments only the file has are kept: one directly above an assignment moves\n\

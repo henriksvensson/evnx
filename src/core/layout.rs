@@ -16,8 +16,23 @@
 //! # The layout rule
 //!
 //! The output is the reference, line by line, with each reference assignment
-//! replaced by the target's assignment for that key (or `KEY=` when the target
-//! has none). Reference comments and blank lines are copied in place.
+//! replaced by the target's assignment for that key (or the placeholder
+//! `# KEY=` when the target has none). Reference comments and blank lines are
+//! copied in place.
+//!
+//! # Keys the target lacks
+//!
+//! ⚠️ **A placeholder, never a blank assignment.** `KEY=` is not the same as an
+//! absent key, measured on synthetic files: Node's `??` and Compose's `${KEY-d}`
+//! read an empty string rather than the default, Compose's `${KEY?}` accepts it,
+//! a later `--env-file` wipes an earlier real value, and `evnx sync --check` and
+//! `evnx diff` stop reporting the key, so `sync --direction reverse` never fills
+//! it. A comment changes none of that, which is what lets this module promise
+//! that aligning a file does not change what any reader gets from it.
+//!
+//! The reference's value is never copied. Exactly `# KEY=`, for a key the
+//! reference has, is evnx's own line: it is dropped once the key has a real
+//! value, and `# KEY=something` is an ordinary comment.
 //!
 //! # The comment rule
 //!
@@ -29,8 +44,9 @@
 //!    written at the reference's position. When the target holds **more**
 //!    copies of that text than the reference, which copy is the target's own
 //!    cannot be decided, and the file is refused ([`LayoutError::AmbiguousComment`]).
-//!    The extras heading ([`EXTRAS_HEADING`]) is owned the same way: it is
-//!    regenerated on every run.
+//!    The extras heading ([`EXTRAS_HEADING`]) and a placeholder are owned the
+//!    same way: evnx regenerates them on every run. Copies of a placeholder are
+//!    never ambiguous, because the line holds nothing to lose.
 //! 2. **Attached.** Any other comment with no blank line between it and the
 //!    next assignment (reference-owned comments in between do not count as a
 //!    gap) belongs to that assignment and moves with it, written directly above
@@ -51,7 +67,7 @@
 //!
 //! # Line endings
 //!
-//! Lines evnx writes (reference comments, blank lines, `KEY=`) take the
+//! Lines evnx writes (reference comments, blank lines, `# KEY=`) take the
 //! target's line ending. A target that mixes CRLF and LF is refused rather than
 //! guessed at. Whether the file ends with a newline, and a UTF-8 byte-order
 //! mark, are kept as the target had them.
@@ -59,13 +75,17 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use super::envfile;
 use super::parser::{ParseError, Parser, ParserConfig};
 
 /// The comment line that heads the keys a reference does not have.
 pub const EXTRAS_HEADING: &str = "# Environment-specific settings";
 
 const BOM: char = '\u{feff}';
+
+/// The line that holds a key's place in a file that lacks it.
+fn placeholder(key: &str) -> String {
+    format!("# {key}=")
+}
 
 /// Why a file cannot be aligned. Shown to the user, so every variant is
 /// line numbers, key names and fixed text — never a value or a source line.
@@ -345,9 +365,9 @@ pub struct Moved {
     pub to_line: usize,
 }
 
-/// A key the target lacked, written as `KEY=` at `line`.
+/// A key the target lacks, whose place is held by `# KEY=` at `line`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Added {
+pub struct Missing {
     pub key: String,
     pub line: usize,
 }
@@ -361,9 +381,10 @@ pub struct Plan {
     /// `output` differs from the target.
     pub changed: bool,
     /// Keys out of reference order in the target, and where each goes. Keys
-    /// that only shifted because others moved or were added are not listed.
+    /// that only shifted because others moved are not listed.
     pub moved: Vec<Moved>,
-    pub added: Vec<Added>,
+    /// Keys the reference has and the target does not. Still absent afterwards.
+    pub missing: Vec<Missing>,
     /// Keys the reference lacks, kept under [`EXTRAS_HEADING`].
     pub extra: Vec<Moved>,
     /// Comment lines only the target has, all kept.
@@ -412,8 +433,15 @@ impl Reference {
     /// counted as the reference's (or evnx's) own.
     fn owned_allowance(&self, text: &str) -> Option<usize> {
         let n = self.comment_counts.get(text).copied().unwrap_or(0);
-        let n = n + usize::from(text == EXTRAS_HEADING);
+        let n = n + usize::from(text == EXTRAS_HEADING || self.is_placeholder(text));
         (n > 0).then_some(n)
+    }
+
+    /// Whether `text` is exactly the placeholder of a key this reference has.
+    fn is_placeholder(&self, text: &str) -> bool {
+        text.strip_prefix("# ")
+            .and_then(|t| t.strip_suffix('='))
+            .is_some_and(|key| self.keys.contains(key))
     }
 
     fn align_unchecked(&self, target: &str) -> Result<Plan, Vec<LayoutError>> {
@@ -429,6 +457,7 @@ impl Reference {
         }
         let mut ambiguous: Vec<LayoutError> = counts
             .iter()
+            .filter(|(text, _)| !self.is_placeholder(text))
             .filter_map(|(text, &(here, first))| {
                 let allowed = self.owned_allowance(text)?;
                 (here > allowed).then_some(LayoutError::AmbiguousComment {
@@ -507,7 +536,7 @@ impl Reference {
         };
 
         emit_standalone(&mut out, None);
-        let mut added_keys: Vec<&str> = Vec::new();
+        let mut missing_keys: Vec<&str> = Vec::new();
         let r = &self.layout;
         for it in &r.items {
             match it {
@@ -517,8 +546,8 @@ impl Reference {
                 }
                 Item::Assign { key, .. } => {
                     out.mark(key);
-                    out.text(&envfile::line(key, ""));
-                    added_keys.push(key);
+                    out.text(&placeholder(key));
+                    missing_keys.push(key);
                 }
             }
         }
@@ -563,9 +592,9 @@ impl Reference {
                 to_line: to_line[*k],
             })
             .collect();
-        let added = added_keys
+        let missing = missing_keys
             .iter()
-            .map(|k| Added {
+            .map(|k| Missing {
                 key: k.to_string(),
                 line: to_line[*k],
             })
@@ -583,7 +612,7 @@ impl Reference {
             changed: output != target,
             output,
             moved,
-            added,
+            missing,
             extra,
             target_comments,
         })
@@ -601,13 +630,13 @@ impl Reference {
             return fail("the result does not parse");
         }
 
-        // Every assignment is the target's, byte for byte, or one evnx added.
+        // Exactly the target's assignments, byte for byte: nothing else may
+        // become something a reader of the file can see.
         let original: HashMap<&str, &str> = before
             .entries
             .iter()
             .map(|e| (e.key.as_str(), e.raw.as_str()))
             .collect();
-        let added: HashSet<&str> = plan.added.iter().map(|a| a.key.as_str()).collect();
         let mut seen = HashSet::new();
         for e in &after.entries {
             if !seen.insert(e.key.as_str()) {
@@ -616,11 +645,10 @@ impl Reference {
             match original.get(e.key.as_str()) {
                 Some(raw) if *raw == e.raw => {}
                 Some(_) => return fail("an assignment changed"),
-                None if added.contains(e.key.as_str()) && e.raw == envfile::line(&e.key, "") => {}
                 None => return fail("an assignment appeared"),
             }
         }
-        if seen.len() != original.len() + added.len() {
+        if seen.len() != original.len() {
             return fail("an assignment went missing");
         }
 
@@ -633,10 +661,13 @@ impl Reference {
             m
         };
         let (b, a) = (count(&before), count(&after));
-        // The extras heading is evnx's own line: it goes when the extras do.
+        // The extras heading and a placeholder are evnx's own lines: the heading
+        // goes when the extras do, a placeholder when the key gets a value.
         let heading = EXTRAS_HEADING.trim_start_matches('#').trim();
         if b.iter()
-            .filter(|(text, _)| text.as_str() != heading)
+            .filter(|(text, _)| {
+                text.as_str() != heading && !self.is_placeholder(&format!("# {text}"))
+            })
             .any(|(text, n)| a.get(text).copied().unwrap_or(0) < *n)
         {
             return fail("a comment went missing");
@@ -791,7 +822,7 @@ REDIS_URL=redis://dev
 "
         );
         assert!(p.changed);
-        assert!(p.added.is_empty() && p.extra.is_empty());
+        assert!(p.missing.is_empty() && p.extra.is_empty());
         let moved: Vec<&str> = p.moved.iter().map(|m| m.key.as_str()).collect();
         assert_eq!(moved.len(), 2, "{moved:?}");
     }
@@ -844,7 +875,7 @@ REDIS_URL=redis://dev
     }
 
     #[test]
-    fn missing_keys_are_added_empty_and_extras_go_last_in_order() {
+    fn missing_keys_get_a_placeholder_and_extras_go_last_in_order() {
         let p = align(REF, "ZED=1\nDB_HOST=h\nALPHA=2\n");
         assert_eq!(
             p.output,
@@ -854,18 +885,18 @@ REDIS_URL=redis://dev
 # === Database ===
 # Host of the primary
 DB_HOST=h
-DB_PORT=
+# DB_PORT=
 
 # === Cache ===
-REDIS_URL=
+# REDIS_URL=
 
 # Environment-specific settings
 ZED=1
 ALPHA=2
 "
         );
-        let added: Vec<_> = p.added.iter().map(|a| (a.key.as_str(), a.line)).collect();
-        assert_eq!(added, [("DB_PORT", 6), ("REDIS_URL", 9)]);
+        let missing: Vec<_> = p.missing.iter().map(|a| (a.key.as_str(), a.line)).collect();
+        assert_eq!(missing, [("DB_PORT", 6), ("REDIS_URL", 9)]);
         let extra: Vec<_> = p
             .extra
             .iter()
@@ -879,7 +910,7 @@ ALPHA=2
     #[test]
     fn reference_values_are_never_copied() {
         let p = align("A=reference-only-value # ref note\n", "");
-        assert_eq!(p.output, "A=\n");
+        assert_eq!(p.output, "# A=\n");
     }
 
     #[test]
@@ -950,7 +981,7 @@ REDIS_URL=r
         let p = align(REF, "REDIS_URL=r\r\nDB_HOST=h");
         assert!(p.output.contains("\r\n") && !p.output.replace("\r\n", "").contains('\n'));
         assert!(p.output.ends_with("REDIS_URL=r"), "{:?}", p.output);
-        assert!(p.output.contains("DB_HOST=h\r\nDB_PORT=\r\n"));
+        assert!(p.output.contains("DB_HOST=h\r\n# DB_PORT=\r\n"));
         assert!(!align(REF, &p.output).changed);
 
         let p = align(REF, "DB_HOST=h");
@@ -990,6 +1021,50 @@ REDIS_URL=r
     }
 
     #[test]
+    fn a_missing_key_stays_absent_for_every_reader() {
+        let p = align("A=\nB=template\n", "A=1\n");
+        assert_eq!(p.output, "A=1\n# B=\n");
+        let doc = parser().parse_document(&p.output);
+        assert_eq!(doc.entries.len(), 1, "a comment, not an assignment");
+        assert!(!align("A=\nB=template\n", &p.output).changed, "idempotent");
+    }
+
+    #[test]
+    fn a_placeholder_goes_when_the_key_gets_a_value() {
+        let reference = "A=\nB=\n";
+        let first = align(reference, "A=1\n").output;
+        // `sync --direction reverse` and setup scripts append at the end.
+        let p = align(reference, &format!("{first}B=2\n"));
+        assert_eq!(p.output, "A=1\nB=2\n");
+        assert!(p.missing.is_empty());
+        assert_eq!(p.target_comments, 0, "the placeholder was never the file's");
+    }
+
+    #[test]
+    fn only_the_exact_placeholder_of_a_reference_key_is_evnxs() {
+        // A value in it, or a key the reference lacks: an ordinary comment, kept.
+        let p = align("A=\nB=\n", "# A=old\n# C=\nA=1\nB=2\n");
+        assert_eq!(p.output, "# A=old\n# C=\nA=1\nB=2\n");
+        assert_eq!(p.target_comments, 2);
+    }
+
+    #[test]
+    fn copies_of_a_placeholder_are_not_ambiguous() {
+        let p = align("A=\nB=\n", "# B=\nA=1\n# B=\n# B=\n");
+        assert_eq!(p.output, "A=1\n# B=\n");
+    }
+
+    #[test]
+    fn a_reference_comment_that_looks_like_a_placeholder_is_stable() {
+        let reference = "# A=\nA=\nB=\n";
+        let p = align(reference, "B=1\n");
+        assert_eq!(p.output, "# A=\n# A=\nB=1\n");
+        assert!(!align(reference, &p.output).changed, "idempotent");
+        let filled = align(reference, "A=2\nB=1\n");
+        assert_eq!(filled.output, "# A=\nA=2\nB=1\n");
+    }
+
+    #[test]
     fn the_extras_heading_goes_when_the_extras_do() {
         let first = align("A=\n", "B=2\nA=1\n");
         assert_eq!(
@@ -1005,7 +1080,7 @@ REDIS_URL=r
     #[test]
     fn an_aligned_file_is_unchanged() {
         let p = align(REF, REF);
-        assert!(!p.changed && p.moved.is_empty() && p.added.is_empty());
+        assert!(!p.changed && p.moved.is_empty() && p.missing.is_empty());
     }
 
     #[test]
