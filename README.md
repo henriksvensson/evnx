@@ -490,6 +490,53 @@ evnx sync --check --direction forward
 
 ---
 
+### `evnx align`
+
+Gives `.env` files the **layout** of the template: its section headings, comments,
+blank lines and key order. Each file keeps its own assignments, moved byte for byte, so
+values, quoting, escapes, `${VAR}` references, inline comments and multiline values
+are never rewritten. Where `sync` adds missing *names*, `align` arranges what is already
+there.
+
+```bash
+# Several environments at once: every file is checked before any is written
+evnx align --reference .env.example --env .env.development --env .env.test
+
+# Preview what would move, be added, or be kept as extra; write nothing, exit 0
+evnx align --env .env --dry-run
+
+# CI: exit 1 when a file is out of alignment
+evnx align --env-name production --check
+```
+
+- A key the file lacks is added as `KEY=`. The template's value is never copied.
+- Keys the template lacks are kept, in their order, at the end under
+  `# Environment-specific settings`.
+- **Comments.** A comment the template also has belongs to the template, which
+  writes it in its own place. Any other comment is kept. One directly above an
+  assignment moves with it. One followed by a blank line stays after the
+  assignment above it, and one above every assignment stays at the top.
+- **Refusals (nothing is written).** Duplicate keys, a line that does not parse,
+  mixed CRLF/LF line endings, and more copies of a template comment than the
+  template has all stop the run, because guessing could lose content. So does the
+  template given again under another name (symlink or hard link).
+- **Writes.** Line endings and the final newline are kept, along with the file's
+  mode. Each file is replaced atomically, but a set of files is not one
+  transaction. A file that is already aligned is not touched, and running `align`
+  again changes nothing.
+- **Output** names files, keys and line numbers only, never a value or a source
+  line, errors included.
+
+| Flag | What it does |
+|---|---|
+| `--reference PATH` | The template to follow (default `[defaults] example`, else `.env.example`) |
+| `--env PATH`, `--env-name NAME` | Files to align; both repeatable (default `.env`, or `[defaults] env_name`) |
+| `-n`, `--dry-run` | Report; write nothing; exit 0 |
+| `--check` | Exit 0 aligned, 1 out of alignment, 2 no verdict; writes nothing |
+| `--format json` | `moved`, `added` and `extra` per file, with line numbers |
+
+---
+
 ### `evnx migrate` _(requires `--features migrate`)_
 
 Moves a `.env` into a secret manager. For **eight** destinations evnx **prints the
@@ -760,7 +807,7 @@ on `PATH` is the usual reason a new install "did not work". No network.
 
 ## Working with multiple environments
 
-`--env-name` resolves `.env.<name>` across `validate`, `diff`, `sync`, `convert`,
+`--env-name` resolves `.env.<name>` across `validate`, `diff`, `sync`, `align`, `convert`,
 `migrate`, `backup` and `template`. `scan` has no `--env-name`: it reads every `.env`
 variant a folder walk finds, or the file you name.
 

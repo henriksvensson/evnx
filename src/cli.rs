@@ -2497,6 +2497,50 @@ file, names that collide, a filter that leaves nothing).
         args: SyncArgs,
     },
 
+    /// Give .env files the template's sections, comments and key order, keeping their values.
+    ///
+    /// Each assignment is moved exactly as written; a key the file lacks is
+    /// added as `KEY=`, and keys the template lacks are kept at the end.
+    /// Prints file names, key names and line numbers, never a value.
+    #[command(after_help = docs::ALIGN.after_help)]
+    Align {
+        /// The ordered template whose layout to follow. Defaults to
+        /// `[defaults] example` in .evnx.toml, else .env.example.
+        #[arg(long, value_name = "PATH")]
+        reference: Option<String>,
+
+        /// A file to align. Repeat for several: every one is checked before
+        /// any is written. Defaults to `.env`, or `[defaults] env_name`.
+        #[arg(long, value_name = "PATH")]
+        env: Vec<String>,
+
+        /// Align `.env.<NAME>`. Repeatable, and combines with --env.
+        #[arg(long, value_name = "NAME")]
+        env_name: Vec<String>,
+
+        /// Show what would move, be added or be kept as extra; write nothing.
+        #[arg(long, short = 'n')]
+        dry_run: bool,
+
+        /// Report alignment through the exit code; write nothing.
+        ///
+        ///   0  every file already has the template's layout
+        ///   1  a file is out of alignment
+        ///   2  no verdict — a file is missing, will not parse, or is the
+        ///      same file as another one named
+        #[arg(long, verbatim_doc_comment)]
+        check: bool,
+
+        /// Output format: `pretty` (default) or `json`.
+        #[arg(
+            long,
+            value_name = "FORMAT",
+            default_value = "pretty",
+            value_parser = ["pretty", "json"]
+        )]
+        format: String,
+    },
+
     /// Generate config files from templates.
     #[command(after_help = docs::TEMPLATE.after_help)]
     Template {

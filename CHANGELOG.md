@@ -46,6 +46,23 @@ exits 0. *Migrate:* a wrapper that treats any non-zero exit from an interactive
     is not there (`--ignore-missing` makes that 0); 4 you answered no.
   - A run ends by saying that removal is not rotation: the value is still in
     git history, older vault versions and the `.bak` copy.
+- **`evnx align`: one layout for every `.env`.** The template given with
+  `--reference` decides section headings, comments, blank lines and key
+  order (default `[defaults] example`, else `.env.example`). Each target keeps
+  its assignments, moved as slices of the original text, so values, quoting,
+  escapes, interpolation, inline comments and multiline values are unchanged.
+  - A missing key is added as `KEY=`; extra keys are kept at the end, in
+    order, under `# Environment-specific settings`.
+  - Comments only the target has are always kept, by a fixed rule (attached
+    to the next assignment, or standalone after the one above). A case the
+    rule cannot decide is refused, as are duplicate keys, a line that does
+    not parse, mixed line endings, and the reference under another name.
+  - Every target is checked before any is written. Each file is replaced
+    atomically and keeps its mode and line endings; a file already aligned is
+    not touched, and a second run changes nothing.
+  - Output, `--format json` and errors name files, keys and lines only.
+    Exits: 0 aligned, 1 `--check` found drift, 2 no verdict. `sync` is
+    unchanged.
 
 ### Changed
 - `sync`'s "sync only adds" hint names `evnx remove NAME --template` instead
@@ -53,7 +70,6 @@ exits 0. *Migrate:* a wrapper that treats any non-zero exit from an interactive
 - `toml_edit` is now always compiled in, not only with the `cloud` feature:
   `remove --contract` needs it. No crate is added to any build: `toml` already
   depends on it.
-
 ## [0.12.0] - 2026-11-01
 
 **Why 0.12.0 and not 0.11.1:** new commands (`evnx parse`, `update --list`),

@@ -535,6 +535,44 @@ fn main() -> Result<()> {
             })
             .map(verdict::finish),
 
+        Commands::Align {
+            reference,
+            env,
+            env_name,
+            dry_run,
+            check,
+            format,
+        } => {
+            // `--env` first, then each `--env-name` resolved the way every other
+            // command resolves one; neither given means `.env` or
+            // `[defaults] env_name`.
+            let mut targets = env;
+            for name in &env_name {
+                targets.push(resolve_env(Path::new("."), None, Some(name), None));
+            }
+            if targets.is_empty() {
+                targets.push(resolve_env(
+                    Path::new("."),
+                    None,
+                    None,
+                    cfg.defaults.env_name.as_deref(),
+                ));
+            }
+            commands::align::run(commands::align::Options {
+                reference: cfg.example_path(reference),
+                targets,
+                mode: if check {
+                    commands::align::Mode::Check
+                } else if dry_run {
+                    commands::align::Mode::DryRun
+                } else {
+                    commands::align::Mode::Write
+                },
+                json: format == "json",
+            })
+            .map(verdict::finish)
+        }
+
         // Commands::Template { input, output, env } => {
         //     commands::template::run(input, output, env, cli.verbose)
         // }
