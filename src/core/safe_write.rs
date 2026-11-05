@@ -89,7 +89,22 @@ pub fn write_with_mode(path: impl AsRef<Path>, bytes: &[u8], mode: u32) -> Resul
 /// called, and named `.backup`) and validate's private `write_backup`.
 pub fn backup(path: impl AsRef<Path>, content: &[u8]) -> Result<PathBuf> {
     let path = path.as_ref();
-    let base = path.as_os_str().to_string_lossy();
+    let candidate = backup_path(path)?;
+    let mode = existing_file(&resolve(path)?.0)?
+        .and_then(|m| existing_mode(&m))
+        .unwrap_or(permissions::PRIVATE);
+    write_with_mode(&candidate, content, mode)
+        .with_context(|| format!("could not keep a backup at {}", candidate.display()))?;
+    Ok(candidate)
+}
+
+/// Where [`backup`] would keep `path`'s copy now: `<path>.bak`, or the first of
+/// `.bak.2` … `.bak.100` that does not exist. An error when all of them do.
+///
+/// Public so a command can ask, before it writes anything, whether git would
+/// see that copy: a `.gitignore` that covers `.env` need not cover `.env.bak`.
+pub fn backup_path(path: impl AsRef<Path>) -> Result<PathBuf> {
+    let base = path.as_ref().as_os_str().to_string_lossy();
     let mut candidate = PathBuf::from(format!("{base}.bak"));
     let mut n = 2;
     while std::fs::symlink_metadata(&candidate).is_ok() {
@@ -102,12 +117,115 @@ pub fn backup(path: impl AsRef<Path>, content: &[u8]) -> Result<PathBuf> {
         candidate = PathBuf::from(format!("{base}.bak.{n}"));
         n += 1;
     }
-    let mode = existing_file(&resolve(path)?.0)?
-        .and_then(|m| existing_mode(&m))
-        .unwrap_or(permissions::PRIVATE);
-    write_with_mode(&candidate, content, mode)
-        .with_context(|| format!("could not keep a backup at {}", candidate.display()))?;
     Ok(candidate)
+}
+
+/// One file a [`replace_all`] changes.
+#[derive(Debug, Clone, Copy)]
+pub struct Replacement<'a> {
+    pub path: &'a Path,
+    /// How errors name it.
+    pub label: &'a str,
+    /// What it held when it was read: compared just before it is replaced, and
+    /// written back if a later file fails.
+    pub original: &'a [u8],
+    pub content: &'a [u8],
+    /// Holds secrets: written as [`write_private`] writes, else as
+    /// [`write_shared`] does.
+    pub private: bool,
+    /// Keep a [`backup`] of `original` first.
+    pub backup: bool,
+}
+
+/// Replace several files as nearly together as files allow. Returns each
+/// file's backup, in order.
+///
+/// 1. Every backup is taken, then every new content is staged. A failure in
+///    either changes nothing visible.
+/// 2. Each file is committed only if it still holds `original`, so an edit made
+///    since it was read is never overwritten (compare and swap).
+/// 3. When a commit fails, the files already committed are written back as
+///    they were, and the error says which were put back, which could not be
+///    (their backups hold the originals), and which were not reached.
+///
+/// ⚠️ Not a transaction: another process can see the first file changed before
+/// the last one is, and a crash between commits leaves some changed. Each file
+/// on its own is replaced atomically.
+///
+/// `before_commit(i, path)` runs just before file `i` is committed. Tests use it
+/// to change a file under the run or to make a write fail; callers pass a
+/// closure that does nothing.
+///
+/// `remove` (S-5, S-6) and `align` share this, so a fix to the rollback is made
+/// once.
+pub fn replace_all(
+    files: &[Replacement<'_>],
+    before_commit: &mut dyn FnMut(usize, &Path),
+) -> Result<Vec<Option<PathBuf>>> {
+    let mut backups = Vec::with_capacity(files.len());
+    for f in files {
+        backups.push(if f.backup {
+            Some(backup(f.path, f.original)?)
+        } else {
+            None
+        });
+    }
+    let mut staged = Vec::with_capacity(files.len());
+    for f in files {
+        staged.push(if f.private {
+            stage_private(f.path, f.content)?
+        } else {
+            stage_shared(f.path, f.content)?
+        });
+    }
+    let mut done: Vec<usize> = Vec::new();
+    for (i, (f, s)) in files.iter().zip(staged).enumerate() {
+        before_commit(i, f.path);
+        let result = match std::fs::read(f.path) {
+            Ok(now) if now == f.original => s.commit().map(|w| report(&w)),
+            Ok(_) => Err(anyhow::anyhow!(
+                "{} changed while evnx was running",
+                f.label
+            )),
+            Err(e) => Err(anyhow::Error::from(e).context(format!("reading {}", f.label))),
+        };
+        if let Err(e) = result {
+            let mut restored = Vec::new();
+            let mut failed = Vec::new();
+            for &j in &done {
+                let q = &files[j];
+                let put_back = if q.private {
+                    write_private(q.path, q.original)
+                } else {
+                    write_shared(q.path, q.original)
+                };
+                match put_back {
+                    Ok(_) => restored.push(q.label),
+                    Err(_) => failed.push(q.label),
+                }
+            }
+            let mut msg = format!("{e:#}\n  {} was not changed.", f.label);
+            if !restored.is_empty() {
+                msg.push_str(&format!(
+                    "\n  Put back as they were: {}.",
+                    restored.join(", ")
+                ));
+            }
+            if !failed.is_empty() {
+                msg.push_str(&format!(
+                    "\n  ⚠ Could not put back: {}. Their .bak copies hold the originals.",
+                    failed.join(", ")
+                ));
+            }
+            let untouched: Vec<&str> = files[i + 1..].iter().map(|f| f.label).collect();
+            if !untouched.is_empty() {
+                msg.push_str(&format!("\n  Not reached: {}.", untouched.join(", ")));
+            }
+            bail!(msg);
+        }
+        done.push(i);
+    }
+    Ok(backups)
 }
 
 /// Stage a private write: the bytes are in a temp file beside the target, and
