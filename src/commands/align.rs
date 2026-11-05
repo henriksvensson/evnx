@@ -14,18 +14,23 @@
 //!    file under two names (a symlink or a hard link) is refused.
 //! 3. Every target is read and aligned in memory. A problem in **any** target
 //!    stops the run before **any** file is written.
-//! 4. `--check` and `--dry-run` report and stop. Otherwise each file that
-//!    changes is staged (a temp file beside it), then each is renamed over its
-//!    original. A file already aligned is not opened for writing.
+//! 4. `--check` and `--dry-run` report and stop. Otherwise a backup that git
+//!    would see is refused, before anything is written: `.gitignore` often
+//!    covers `.env` and not `.env.bak`.
+//! 5. The files that change are written through [`safe_write::replace_all`],
+//!    as `remove` writes them: each kept as `.bak` (unless `--no-backup`), all
+//!    staged, then each committed only if it still holds what was read. If one
+//!    fails, those already replaced are put back. A file already aligned is not
+//!    opened for writing and gets no backup.
 //!
-//! ⚠️ Each replacement is atomic; the set is not. If renaming the second of two
-//! files fails, the first has already been replaced, and the error says which
-//! files were written and which were not.
+//! ⚠️ Each replacement is atomic; the set is not one transaction. Another
+//! process can see the first file aligned before the last one is.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use crate::core::gitignore::{self, Exposure};
 use crate::core::layout::{LayoutError, Plan, Reference, EXTRAS_HEADING};
 use crate::core::safe_write;
 use crate::core::verdict::Verdict;
@@ -48,6 +53,8 @@ pub struct Options {
     pub targets: Vec<String>,
     pub mode: Mode,
     pub json: bool,
+    /// Keep no `.bak` copy of a file before replacing it.
+    pub no_backup: bool,
 }
 
 /// A target that has been read and aligned in memory.
@@ -59,6 +66,12 @@ struct Prepared {
 
 /// Run `evnx align`. `Ok` is the verdict; `Err` is "no verdict" (exit 2).
 pub fn run(opts: Options) -> Result<Verdict> {
+    run_with(opts, &mut |_, _| {})
+}
+
+/// [`run`], with a call just before each file is replaced, so tests can change
+/// a file under the run or make a write fail.
+pub fn run_with(opts: Options, before_commit: &mut dyn FnMut(usize, &Path)) -> Result<Verdict> {
     if opts.targets.is_empty() {
         bail!("no file to align: pass --env (or --env-name)");
     }
@@ -87,9 +100,26 @@ pub fn run(opts: Options) -> Result<Verdict> {
     }
 
     let drifted = prepared.iter().filter(|p| p.plan.changed).count();
+    let exposed = if opts.no_backup || opts.mode == Mode::Check {
+        Vec::new()
+    } else {
+        exposed_backups(&prepared)?
+    };
+    match opts.mode {
+        Mode::Write if !exposed.is_empty() => bail!(
+            "nothing was aligned and no file was written:\n{}",
+            exposed.join("\n")
+        ),
+        Mode::DryRun => {
+            for e in &exposed {
+                ui::warning(format!("a real run would refuse: {}", e.trim_start()));
+            }
+        }
+        _ => {}
+    }
     match opts.mode {
         Mode::Check | Mode::DryRun => {
-            report(&opts, &prepared, &[]);
+            report(&opts, &prepared, &Written::default());
             let verdict = if opts.mode == Mode::Check && drifted > 0 {
                 Verdict::Findings
             } else {
@@ -98,7 +128,7 @@ pub fn run(opts: Options) -> Result<Verdict> {
             Ok(verdict)
         }
         Mode::Write => {
-            let written = write_all(&prepared)?;
+            let written = write_all(&prepared, opts.no_backup, before_commit)?;
             report(&opts, &prepared, &written);
             Ok(Verdict::Clean)
         }
@@ -181,61 +211,86 @@ fn prepare(reference: &Reference, path: &str) -> std::result::Result<Prepared, V
     })
 }
 
-/// Stage every change, then commit them in order. Returns the paths written.
-fn write_all(prepared: &[Prepared]) -> Result<Vec<String>> {
-    let changing: Vec<&Prepared> = prepared.iter().filter(|p| p.plan.changed).collect();
-    let mut staged = Vec::with_capacity(changing.len());
-    for p in &changing {
-        let s =
-            safe_write::stage_private(&p.path, p.plan.output.as_bytes()).with_context(|| {
-                format!("no file was written: could not prepare {}", label(&p.path))
-            })?;
-        staged.push((p, s));
-    }
-
-    let mut written: Vec<String> = Vec::new();
-    for (p, s) in staged {
-        let result = unchanged_since_read(p).and_then(|()| s.commit());
-        match result {
-            Ok(w) => {
-                safe_write::report(&w);
-                written.push(p.path.clone());
-            }
-            Err(e) => {
-                let rest: Vec<String> = changing
-                    .iter()
-                    .map(|q| label(&q.path))
-                    .filter(|q| !written.iter().any(|w| label(w) == *q))
-                    .collect();
-                let done = if written.is_empty() {
-                    "none".to_string()
-                } else {
-                    written
-                        .iter()
-                        .map(|w| label(w))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                return Err(e.context(format!(
-                    "could not replace {}. Already aligned and written: {done}. Not written: {}. \
-                     Each file is replaced atomically, but the set is not one transaction.",
-                    label(&p.path),
-                    rest.join(", ")
-                )));
-            }
+/// The backup of each changing file that git would see, worded for output.
+///
+/// ⚠️ `.gitignore` covering `.env` says nothing about `.env.bak`, and a copy of
+/// the secrets that `git add .` would take is worse than no backup. Outside a
+/// git work tree there is nothing to ask, and nothing is refused.
+fn exposed_backups(prepared: &[Prepared]) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for p in prepared.iter().filter(|p| p.plan.changed) {
+        let backup = safe_write::backup_path(&p.path)?;
+        let dir = match backup.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        let name = backup.file_name().unwrap_or_default().to_string_lossy();
+        if gitignore::in_work_tree(&dir) && gitignore::exposure(&dir, &name) != Exposure::Protected
+        {
+            let file = Path::new(&p.path)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy();
+            out.push(format!(
+                "  {} would be backed up to {}, which .gitignore does not cover, so \
+                 `git add` would take a copy of its secrets. Add `{file}.bak*` to \
+                 .gitignore, or pass --no-backup.",
+                label(&p.path),
+                label(&backup.to_string_lossy())
+            ));
         }
     }
-    Ok(written)
+    Ok(out)
 }
 
-/// Refuse to replace a file that changed after it was read: the plan was made
-/// from the old content and would overwrite the edit.
-fn unchanged_since_read(p: &Prepared) -> Result<()> {
-    let now = std::fs::read(&p.path).with_context(|| format!("re-reading {}", label(&p.path)))?;
-    if now != p.original {
-        bail!("{} changed while evnx was reading it", label(&p.path));
+/// What a write did: the files replaced, and each one's backup.
+#[derive(Default)]
+struct Written {
+    paths: Vec<String>,
+    backups: Vec<(String, PathBuf)>,
+}
+
+impl Written {
+    fn contains(&self, path: &str) -> bool {
+        self.paths.iter().any(|p| p == path)
     }
-    Ok(())
+    fn backup_of(&self, path: &str) -> Option<String> {
+        self.backups
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, b)| label(&b.to_string_lossy()))
+    }
+}
+
+/// Back up, stage and commit every change, through the write `remove` uses.
+fn write_all(
+    prepared: &[Prepared],
+    no_backup: bool,
+    before_commit: &mut dyn FnMut(usize, &Path),
+) -> Result<Written> {
+    let changing: Vec<&Prepared> = prepared.iter().filter(|p| p.plan.changed).collect();
+    let labels: Vec<String> = changing.iter().map(|p| label(&p.path)).collect();
+    let files: Vec<safe_write::Replacement<'_>> = changing
+        .iter()
+        .zip(&labels)
+        .map(|(p, l)| safe_write::Replacement {
+            path: Path::new(&p.path),
+            label: l,
+            original: &p.original,
+            content: p.plan.output.as_bytes(),
+            private: true,
+            backup: !no_backup,
+        })
+        .collect();
+    let backups = safe_write::replace_all(&files, before_commit)?;
+    Ok(Written {
+        paths: changing.iter().map(|p| p.path.clone()).collect(),
+        backups: changing
+            .iter()
+            .zip(backups)
+            .filter_map(|(p, b)| b.map(|b| (p.path.clone(), b)))
+            .collect(),
+    })
 }
 
 // ── Report ────────────────────────────────────────────────────────────────────
@@ -261,6 +316,8 @@ struct JsonTarget<'a> {
     missing: Vec<JsonMissing<'a>>,
     extra: Vec<JsonMove<'a>>,
     target_only_comments: usize,
+    /// The `.bak` kept before this file was replaced: write mode only.
+    backup: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -276,7 +333,7 @@ struct JsonMissing<'a> {
     line: usize,
 }
 
-fn status(p: &Prepared, written: &[String]) -> &'static str {
+fn status(p: &Prepared, written: &Written) -> &'static str {
     if !p.plan.changed {
         "aligned"
     } else if written.contains(&p.path) {
@@ -286,7 +343,7 @@ fn status(p: &Prepared, written: &[String]) -> &'static str {
     }
 }
 
-fn report(opts: &Options, prepared: &[Prepared], written: &[String]) {
+fn report(opts: &Options, prepared: &[Prepared], written: &Written) {
     if opts.json {
         let r = JsonReport {
             schema_version: 1,
@@ -314,6 +371,7 @@ fn report(opts: &Options, prepared: &[Prepared], written: &[String]) {
                         .collect(),
                     extra: moves(&p.plan.extra),
                     target_only_comments: p.plan.target_comments,
+                    backup: written.backup_of(&p.path),
                 })
                 .collect(),
         };
@@ -358,6 +416,9 @@ fn report(opts: &Options, prepared: &[Prepared], written: &[String]) {
         }
         if p.plan.changed {
             details(&p.plan);
+            if let Some(b) = written.backup_of(&p.path) {
+                println!("    backup  {b}");
+            }
         }
     }
 
@@ -435,5 +496,88 @@ fn details(plan: &Plan) {
     }
     if plan.moved.is_empty() && plan.missing.is_empty() && plan.extra.is_empty() {
         println!("    layout  headings, comments or blank lines from the reference");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const REFERENCE: &str = "A=\nB=\n";
+    const FILES: &[&str] = &[".env.one", ".env.two", ".env.three"];
+
+    fn project() -> tempfile::TempDir {
+        let d = tempfile::TempDir::new().unwrap();
+        std::fs::write(d.path().join(".env.example"), REFERENCE).unwrap();
+        for (i, f) in FILES.iter().enumerate() {
+            std::fs::write(d.path().join(f), format!("B={i}\nA={i}\n")).unwrap();
+        }
+        d
+    }
+
+    fn options(d: &tempfile::TempDir) -> Options {
+        let at = |f: &str| d.path().join(f).to_string_lossy().into_owned();
+        Options {
+            reference: at(".env.example"),
+            targets: FILES.iter().map(|f| at(f)).collect(),
+            mode: Mode::Write,
+            json: false,
+            no_backup: false,
+        }
+    }
+
+    fn read(d: &tempfile::TempDir, f: &str) -> String {
+        std::fs::read_to_string(d.path().join(f)).unwrap()
+    }
+
+    /// The third replacement fails: the first two are put back, every file
+    /// holds what it held, and the backups taken first stay.
+    #[test]
+    fn a_failed_third_write_puts_the_first_two_back() {
+        let d = project();
+        let err = run_with(options(&d), &mut |i, path| {
+            if i == 2 {
+                std::fs::remove_file(path).unwrap();
+                std::fs::create_dir(path).unwrap();
+            }
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("Put back as they were: "), "{err}");
+        assert!(
+            err.contains(".env.one, ") && err.contains(".env.two."),
+            "{err}"
+        );
+        assert_eq!(read(&d, ".env.one"), "B=0\nA=0\n");
+        assert_eq!(read(&d, ".env.two"), "B=1\nA=1\n");
+        assert_eq!(read(&d, ".env.one.bak"), "B=0\nA=0\n");
+    }
+
+    /// A file edited after it was read is not overwritten, and the file already
+    /// replaced before it is put back.
+    #[test]
+    fn a_file_changed_under_the_run_is_left_alone_and_the_rest_put_back() {
+        let d = project();
+        let err = run_with(options(&d), &mut |i, path| {
+            if i == 1 {
+                std::fs::write(path, "B=edited\n").unwrap();
+            }
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("changed while evnx was running"), "{err}");
+        assert!(err.contains("Not reached: "), "{err}");
+        assert_eq!(read(&d, ".env.one"), "B=0\nA=0\n");
+        assert_eq!(read(&d, ".env.two"), "B=edited\n");
+        assert_eq!(read(&d, ".env.three"), "B=2\nA=2\n");
+    }
+
+    #[test]
+    fn a_good_run_aligns_every_file() {
+        let d = project();
+        run_with(options(&d), &mut |_, _| {}).unwrap();
+        for (i, f) in FILES.iter().enumerate() {
+            assert_eq!(read(&d, f), format!("A={i}\nB={i}\n"), "{f}");
+        }
     }
 }

@@ -2540,6 +2540,13 @@ file, names that collide, a filter that leaves nothing).
             value_parser = ["pretty", "json"]
         )]
         format: String,
+
+        /// Keep no `.bak` copy of a file before replacing it.
+        ///
+        /// Without it, a `.bak` that `.gitignore` does not cover is refused
+        /// before anything is written: it would hold a copy of the secrets.
+        #[arg(long)]
+        no_backup: bool,
     },
 
     /// Generate config files from templates.

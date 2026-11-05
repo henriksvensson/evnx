@@ -518,3 +518,76 @@ fn sync_is_unaffected_by_the_extras_heading() {
     let after = run(p.path(), &["sync", "--check", "--direction", "reverse"]);
     assert_eq!(before.code, after.code);
 }
+
+// ── Backups ──────────────────────────────────────────────────────────────────
+
+#[cfg(unix)]
+#[test]
+fn a_changed_file_is_kept_as_bak_with_its_mode_first() {
+    use std::os::unix::fs::PermissionsExt;
+    let before = format!("DB_PORT=1\nDB_HOST={MARK}\n");
+    let p = project(&[(".env", &before)]).mode(".env", 0o640);
+    align(&p, &[])
+        .assert_code(0)
+        .assert_contains("    backup  ./.env.bak");
+    assert_eq!(p.read(".env.bak"), before);
+    let mode = std::fs::metadata(p.join(".env.bak"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o640, "the copy is as private as the original");
+
+    // Already aligned: nothing written, so no second copy.
+    align(&p, &[]).assert_code(0);
+    assert!(!p.exists(".env.bak.2"));
+}
+
+#[test]
+fn no_backup_keeps_no_copy_and_json_says_where_one_went() {
+    let p = project(&[
+        (".env", "DB_PORT=1\nDB_HOST=2\n"),
+        (".env.b", "DB_PORT=1\nDB_HOST=2\n"),
+    ]);
+    align(&p, &["--no-backup"]).assert_code(0);
+    assert!(!p.exists(".env.bak"));
+
+    let out = align(&p, &["--env", ".env.b", "--format", "json"]);
+    out.assert_code(0);
+    let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(v["targets"][0]["status"], "written");
+    assert_eq!(v["targets"][0]["backup"], "./.env.b.bak");
+}
+
+#[test]
+fn a_backup_git_would_see_is_refused_before_anything_is_written() {
+    // `.gitignore` covers `.env` and not `.env.bak`.
+    let p = project(&[
+        (".env", &format!("DB_PORT=1\nDB_HOST={MARK}\n")),
+        (".gitignore", ".env\n"),
+    ])
+    .git();
+    age(&p.join(".env"));
+    let before = state(&p.join(".env"));
+
+    align(&p, &[])
+        .assert_code(2)
+        .assert_contains("./.env would be backed up to ./.env.bak, which .gitignore does not cover")
+        .assert_contains("Add `.env.bak*` to .gitignore, or pass --no-backup");
+    assert_eq!(state(&p.join(".env")), before);
+    assert!(!p.exists(".env.bak"));
+
+    // A dry run says so and still writes nothing; --check is not about writes.
+    align(&p, &["--dry-run"])
+        .assert_code(0)
+        .assert_contains("a real run would refuse: ./.env would be backed up");
+    align(&p, &["--check"])
+        .assert_code(1)
+        .assert_not_contains("would refuse");
+    assert_eq!(state(&p.join(".env")), before);
+
+    // Covered: the run goes ahead, and git still sees nothing new.
+    std::fs::write(p.join(".gitignore"), ".env\n.env.bak*\n").unwrap();
+    align(&p, &[]).assert_code(0);
+    assert!(p.exists(".env.bak") && p.is_ignored(".env.bak"));
+}

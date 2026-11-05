@@ -59,9 +59,12 @@ exits 0. *Migrate:* a wrapper that treats any non-zero exit from an interactive
     to the next assignment, or standalone after the one above). A case the
     rule cannot decide is refused, as are duplicate keys, a line that does
     not parse, mixed line endings, and the reference under another name.
-  - Every target is checked before any is written. Each file is replaced
-    atomically and keeps its mode and line endings; a file already aligned is
-    not touched, and a second run changes nothing.
+  - Every target is checked before any is written, and written as `remove`
+    writes: kept as `.bak` first (`--no-backup` skips it), replaced only if it
+    still holds what was read, and put back if a later file fails. A `.bak`
+    that `.gitignore` does not cover is refused before anything is written. Each
+    file keeps its mode and line endings; a file already aligned is not touched,
+    and a second run changes nothing.
   - Output, `--format json` and errors name files, keys and lines only.
     Exits: 0 aligned, 1 `--check` found drift, 2 no verdict. `sync` is
     unchanged.

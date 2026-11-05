@@ -526,10 +526,14 @@ evnx align --env-name production --check
   mixed CRLF/LF line endings, and more copies of a template comment than the
   template has all stop the run, because guessing could lose content. So does the
   template given again under another name (symlink or hard link).
-- **Writes.** Line endings and the final newline are kept, along with the file's
-  mode. Each file is replaced atomically, but a set of files is not one
-  transaction. A file that is already aligned is not touched, and running `align`
-  again changes nothing.
+- **Writes.** Line endings, the final newline and the file's mode are kept. A file
+  that changes is first kept as `.bak` (`.bak.2` … if one exists), as `evnx remove`
+  does, unless `--no-backup`. A `.bak` that `.gitignore` does not cover is refused
+  before anything is written, because it would be an untracked copy of the
+  secrets: add `.env.bak*` to `.gitignore`. Each file is replaced atomically and
+  only if it still holds what was read; if a later file fails, the ones already
+  replaced are put back. A file that is already aligned is not touched and gets
+  no backup, and running `align` again changes nothing.
 - **Output** names files, keys and line numbers only, never a value or a source
   line, errors included.
 
@@ -539,7 +543,8 @@ evnx align --env-name production --check
 | `--env PATH`, `--env-name NAME` | Files to align; both repeatable (default `.env`, or `[defaults] env_name`) |
 | `-n`, `--dry-run` | Report; write nothing; exit 0 |
 | `--check` | Exit 0 aligned, 1 out of alignment, 2 no verdict; writes nothing |
-| `--format json` | `moved`, `missing` and `extra` per file, with line numbers |
+| `--format json` | `moved`, `missing` and `extra` per file, with line numbers, and `backup` |
+| `--no-backup` | Keep no `.bak` copy of a file before replacing it |
 
 ---
 

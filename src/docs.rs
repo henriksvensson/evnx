@@ -178,9 +178,10 @@ Examples:\n\
 \x20 evnx align --reference .env.example --env .env --dry-run\n\
 \x20 evnx align --env-name production --check\n\
 \n\
-Every file is read and checked before any is written. Each file is replaced\n\
-atomically and keeps its mode; the set is not one transaction. A file that is\n\
-already aligned is not touched.\n\
+Every file is read and checked before any is written, and one already aligned\n\
+is not touched. A file that changes is kept as .bak first (--no-backup to\n\
+skip); a .bak that .gitignore does not cover is refused, since it would hold\n\
+the secrets. If a later file fails, the ones already replaced are put back.\n\
 \n\
 Exit codes: 0 aligned (or written, or a dry run); 1 --check found a file out\n\
 of alignment; 2 could not run (missing file, parse error, same file twice).\n\

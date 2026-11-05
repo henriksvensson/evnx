@@ -542,6 +542,7 @@ fn main() -> Result<()> {
             dry_run,
             check,
             format,
+            no_backup,
         } => {
             // `--env` first, then each `--env-name` resolved the way every other
             // command resolves one; neither given means `.env` or
@@ -569,6 +570,7 @@ fn main() -> Result<()> {
                     commands::align::Mode::Write
                 },
                 json: format == "json",
+                no_backup,
             })
             .map(verdict::finish)
         }
